@@ -14,7 +14,7 @@ Resets at 00:00 UTC. Details and the full model list: [OpenAI help article](http
 
 **Turn it on:** [Settings → Data controls → Sharing](https://platform.openai.com/settings/organization/data-controls/sharing), "Share inputs and outputs with OpenAI" → enabled. If your org qualifies you'll see "You're enrolled for complimentary daily tokens":
 
-![Data controls → Sharing: enable sharing inputs and outputs](enable_data_sharing_annotated.png)
+![Data controls → Sharing: enable sharing inputs and outputs](data-controls-sharing.png)
 
 Only traffic you share counts, and OpenAI uses it to train its models, so keep secrets and private data out of it.
 
