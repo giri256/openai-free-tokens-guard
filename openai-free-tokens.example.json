@@ -1,0 +1,9 @@
+{
+  "tier": "build",
+  "alertAt": [0.85, 0.95],
+  "wrapUpAt": 0.95,
+  "onExhausted": "block",
+  "onUncoveredModel": "block",
+  "handoffFile": "HANDOFF.md",
+  "notify": true
+}
