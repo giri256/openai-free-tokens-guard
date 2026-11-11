@@ -60,7 +60,7 @@ It guards the `openai` provider when you are connected with an **API key** (Chat
 Check the meter without spending tokens:
 
 ```bash
-npx github:giri256/openai-free-tokens-guard status
+npx --allow-git=all github:giri256/openai-free-tokens-guard status
 ```
 
 `steps` prints the per-request breakdown (fresh input, cache read, cache write, output, reasoning), `set big 120000` syncs today's count with OpenAI's usage dashboard (needed if other apps use the same org).
