@@ -1,18 +1,20 @@
 {
   "name": "opencode-openai-free-tokens",
-  "version": "0.1.0",
-  "description": "Stay inside OpenAI's free daily data-sharing tokens: meter, 85%/95% alerts, agent handoff, hard block before paid usage. opencode plugin + language-neutral spec to port into any app.",
+  "version": "0.2.0",
+  "description": "Stay inside OpenAI's free daily data-sharing tokens: meter, 85%/95% alerts, agent handoff, soft stop before paid usage, usage in the TUI sidebar. opencode plugin + language-neutral spec to port into any app.",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
-    "./server": "./index.js"
+    "./server": "./index.js",
+    "./tui": "./tui.js"
   },
   "bin": {
     "opencode-openai-free-tokens": "./cli.js"
   },
   "files": [
     "index.js",
+    "tui.js",
     "cli.js",
     "README.md",
     "SPEC.md",

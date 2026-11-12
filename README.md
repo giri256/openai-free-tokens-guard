@@ -24,8 +24,9 @@ Only traffic you share counts, and OpenAI uses it to train its models, so keep s
 
 - **Meters** every request per pool and per UTC day (cached and reasoning tokens included, as OpenAI counts them).
 - **Alerts** at **85 %** and **95 %**.
-- **Wraps up**: before the pool runs out, tells the working agent to stop and write a `HANDOFF.md` in the project, while there is still room to do it.
-- **Blocks** any request that would cross the free limit, and any model the offer doesn't cover, *before* it is sent.
+- **Soft stop**: at **95 %**, or when the next request would cross the free limit, or on a model the offer doesn't cover, it tells the working agent to stop and write a `HANDOFF.md` in the project. Nothing is cut off: tell the agent to carry on and it will.
+- **Shows the meter** in opencode's TUI sidebar: tokens used and left and % per pool, with a bar that is green, then orange from 50 %, then red from 85 %, plus the time to reset.
+- **Hard block (opt-in)**: with `"onExhausted": "block"`, a request that would cross the limit is never sent.
 
 ## Use it in your own app (any language)
 
@@ -57,7 +58,23 @@ Then set your tier in `~/.config/opencode/openai-free-tokens.json` (see [`openai
 
 It guards the `openai` provider when you are connected with an **API key** (ChatGPT-login traffic is not API-billed and is left alone).
 
-Check the meter without spending tokens:
+The session sidebar of the opencode TUI gets an **OpenAI free tokens** section above Context, refreshed every 2 s. Each pool's bar and percentage are **green** below 50 %, **orange** from 50 %, **red** from 85 %:
+
+```
+OpenAI free tokens
+
+Large models                      44%
+████████████████░░░░░░░░░░░░░░░░░░░░░
+111,013 used · 138,987 left
+
+Mini models                        0%
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+0 used · 2,500,000 left
+
+Resets in 22h 45m · 00:00 UTC
+```
+
+Check the meter from a shell, without spending tokens:
 
 ```bash
 npx --allow-git=all github:giri256/openai-free-tokens-guard status
@@ -73,12 +90,11 @@ npx --allow-git=all github:giri256/openai-free-tokens-guard status
 | `tier` | `build` | `build`, `launch` or `grow` |
 | `limits` | from tier | `{ "big": n, "mini": n }` |
 | `alertAt` | `[0.85, 0.95]` | alert thresholds |
-| `wrapUpAt` | `0.95` | ask the agent for a handoff |
-| `wrapUpRequests` | `2` | …or when fewer than this many requests of the current size fit |
-| `onExhausted` | `block` | `block` or `warn` |
-| `onUncoveredModel` | `block` | `block`, `warn` or `allow` |
+| `wrapUpAt` | `0.95` | soft stop: ask the agent for a handoff (also when the next request would cross the limit) |
+| `onExhausted` | `stop` | `stop` (soft, agent is told to stop), `block` (hard: request not sent) or `warn` (notification only) |
+| `onUncoveredModel` | `stop` | `stop`, `block`, `warn` or `allow` |
 | `outputReserve` | `16000` | tokens reserved for the reply in each estimate |
-| `capOutput` | `true` | near the limit, cap the reply so the request can't cross it |
+| `capOutput` | `true` | block mode only: near the limit, cap the reply so the request can't cross it |
 | `handoffFile` | `HANDOFF.md` | written in the session's directory |
 | `notify` | `true` | desktop notifications (Linux, macOS, Windows) |
 | `models` / `extraModels` | built-in lists | replace / extend the pool lists |

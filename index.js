@@ -8,11 +8,13 @@
 //    per UTC day (the free allowance resets at 00:00 UTC), in a ledger shared by
 //    every opencode process on the machine;
 //  - alerts at 85 % and 95 % (desktop notification + a note in the session);
-//  - when the pool is nearly used up, tells the working agent to stop and write a
-//    handoff file into the project directory;
-//  - blocks any request that would cross the free limit (OpenAI bills such a
-//    request IN FULL), and any model that is not covered by the offer, by
-//    pointing it at a local stub instead of api.openai.com — nothing is sent.
+//  - soft stop (default): at 95 % of a pool, or when the next request would
+//    cross the free limit (OpenAI bills such a request IN FULL), or on a model
+//    the offer doesn't cover, it tells the working agent to stop and write a
+//    handoff file into the project directory. Nothing is cut off; the owner can
+//    tell the agent to carry on;
+//  - hard block (opt-in, "onExhausted": "block"): such requests are pointed at a
+//    local stub instead of api.openai.com, so nothing is sent.
 //
 // No dependencies: node builtins only. Never throws into opencode: every hook is
 // guarded and fails open for bookkeeping, closed (block) only by explicit decision.
@@ -64,13 +66,12 @@ export const DEFAULTS = {
   extraModels: null, // { big: [...], mini: [...] } — added to the built-in lists
   providers: ["openai"], // opencode provider ids to guard
   alertAt: [0.85, 0.95], // owner alerts (fractions of the pool)
-  wrapUpAt: 0.95, // tell the agent to write a handoff and stop
-  wrapUpRequests: 2, // ...also when fewer than this many requests of the current size still fit
-  onExhausted: "block", // block | warn — a request that would cross the free limit
-  onUncoveredModel: "block", // block | warn | allow — a model outside both pools (billed from token 1)
+  wrapUpAt: 0.95, // soft stop: tell the agent to write a handoff and stop (also when the next request would cross the limit)
+  onExhausted: "stop", // stop (soft, default) | block (hard: request never sent) | warn (notification only)
+  onUncoveredModel: "stop", // stop | block | warn | allow — a model outside both pools (billed from token 1)
   outputReserve: 16_000, // tokens assumed for the reply when estimating a request
-  charsPerToken: 3, // prompt-size estimate (conservative: real text is ~3.5-4)
-  capOutput: true, // near the limit, cap the reply size so the request cannot cross it
+  charsPerToken: 4, // first guess for the prompt-size estimate; each session then calibrates its own ratio from real usage
+  capOutput: true, // block mode only: near the limit, cap the reply size so the request cannot cross it
   handoffFile: "HANDOFF.md", // written in the session's project directory
   notify: true, // desktop notifications
   sessionNotes: false, // experimental: alert notes in the session transcript (session.synthetic; can stall server shutdown)
@@ -187,6 +188,15 @@ export class Ledger {
     this.cache = { day, size, used }
     return used
   }
+}
+
+/** Today's meter for displays (TUI sidebar, CLI): tier, limits, used per pool, time to reset. */
+const meterLedgers = new Map()
+export function meter(ctxOptions) {
+  const o = loadOptions(ctxOptions)
+  let l = meterLedgers.get(o.stateDir)
+  if (!l) meterLedgers.set(o.stateDir, (l = new Ledger(o.stateDir)))
+  return { enabled: o.enabled, tier: o.tier, day: utcDay(), limit: o.limit, used: l.used(), resetsIn: msToUtcMidnight() }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +352,11 @@ export default {
     const stubURL = stub ? `http://127.0.0.1:${stub.address().port}` : "http://127.0.0.1:9"
     debug({ ev: "load", opt: { ...opt, pools: undefined }, stubURL })
 
+    // opencode can load the plugin once per location in the same process, and reloads it when its files
+    // change: keep dedup and per-session state process-wide so a reload mid-request loses no usage
+    const G = (globalThis.__openaiFreeTokens ||= { counted: new Set(), responses: new WeakSet() })
     // per-session state
-    const sess = new Map() // sessionID -> { estimate, lastPrompt, lastOutput, pool, model, wrapped:day, dir, pendingBlock }
+    const sess = (G.sess ||= new Map()) // sessionID -> { estimate, lastPrompt, lastOutput, pool, model, wrapped:day, dir, inflight }
     const S = (id) => {
       let s = sess.get(id)
       if (!s) {
@@ -354,8 +367,6 @@ export default {
       return s
     }
     const alerted = new Set() // `${day}:${pool}:${level}` — per process; cross-process dedup via marker files
-    // opencode can load the plugin once per location in the same process: dedup process-wide
-    const G = (globalThis.__openaiFreeTokens ||= { counted: new Set(), responses: new WeakSet() })
     const counted = G.counted // dedup of step events
 
     const alertOnce = (key) => {
@@ -444,19 +455,23 @@ export default {
     const decide = (s, estOverride) => {
       // returns { block: string|null, wrapUp: bool, used, limit, remaining }
       if (!s.pool) {
-        if (opt.onUncoveredModel === "block")
+        const mode = opt.onUncoveredModel
+        if (mode === "block")
           return {
             block:
               `[openai-free-tokens] Model "${s.model}" is not covered by OpenAI's free daily tokens, so every token would be billed. ` +
               `Blocked. Switch to a covered model, or set "onUncoveredModel": "allow" in openai-free-tokens.json.`,
           }
-        return { block: null, wrapUp: false, uncovered: true }
+        return { block: null, wrapUp: false, uncovered: mode !== "allow", stopUncovered: mode === "stop" }
       }
-      const used = ledger.used()[s.pool]
+      // + this session's last request if its usage event hasn't arrived yet (the next request is often
+      // decided a few ms before the previous one is metered)
+      const used = ledger.used()[s.pool] + (s.inflight || []).reduce((a, r) => a + r.promptEst, 0)
       const limit = opt.limit[s.pool]
       const est = estOverride || s.estimate || opt.outputReserve
       const remaining = limit - used
-      if (used + est > limit && opt.onExhausted === "block") {
+      const crosses = used + est > limit
+      if (crosses && opt.onExhausted === "block") {
         return {
           block:
             `[openai-free-tokens] Stopped: this request (~${fmt(est)} tokens) would take the ${POOL_LABEL[s.pool]} past today's free ` +
@@ -467,8 +482,9 @@ export default {
           remaining,
         }
       }
-      const wrapUp = used >= limit * opt.wrapUpAt || remaining < est * opt.wrapUpRequests
-      return { block: null, wrapUp, used, limit, remaining, est }
+      // soft stop: only at the threshold, or when this very request would cross the limit
+      const wrapUp = opt.onExhausted !== "warn" && (used >= limit * opt.wrapUpAt || crosses)
+      return { block: null, wrapUp, crosses, used, limit, remaining, est }
     }
 
     // A session that started before this process: read its last real prompt size from history,
@@ -508,24 +524,41 @@ export default {
         s.pool = poolOf(s.model, opt.pools)
         const chars = textChars(ev.system) + textChars(ev.messages) + textChars(ev.tools)
         if (!s.primed) await primeSession(id)
-        const promptEst = Math.max(Math.ceil(chars / opt.charsPerToken), s.lastPrompt + s.lastOutput)
+        // chars per token: calibrated per session from the last real prompt (text here runs ~4.8,
+        // JSON-heavy tool schemas included); the last real prompt + reply is a floor (history only grows)
+        const ratio = s.ratio || opt.charsPerToken
+        const promptEst = Math.max(Math.ceil(chars / ratio), s.lastPrompt + s.lastOutput)
+        s.ctxChars = chars
         s.estimate = promptEst + opt.outputReserve
         s.promptEst = promptEst
         const d = decide(s)
-        debug({ ev: "context", sessionID: id, model: s.model, pool: s.pool, chars, promptEst, d })
-        if (d.block || !s.pool) return
-        if (d.wrapUp && !isCompaction && Array.isArray(ev.system)) {
-          ev.system.push({
-            type: "text",
-            text:
-              `IMPORTANT — OpenAI free token allowance almost used up (${fmt(d.used)} of ${fmt(d.limit)} tokens today, ` +
-              `${fmt(Math.max(0, d.remaining))} left; further use would be billed). Stop your current work now. ` +
-              `Write a concise handoff to the file ${opt.handoffFile} in the project root (the directory you are working in): ` +
-              `the task, what is done, what is in progress, exact next steps, files touched, and any commands or ` +
-              `findings needed to continue. Use one file write, no other tool calls, then end your turn with a one-line summary.`,
-          })
+        debug({ ev: "context", sessionID: id, model: s.model, pool: s.pool, chars, ratio, promptEst, d })
+        if (d.block) return
+        const stopNote =
+          `If the owner's latest message explicitly says to continue despite the cost, follow it instead. Otherwise ` +
+          `write a concise handoff to the file ${opt.handoffFile} in the project root (the directory you are working in): ` +
+          `the task, what is done, what is in progress, exact next steps, files touched, and any commands or ` +
+          `findings needed to continue. Use one file write, no other tool calls, then end your turn with a one-line summary.`
+        if (!isCompaction && Array.isArray(ev.system)) {
+          if (d.wrapUp)
+            ev.system.push({
+              type: "text",
+              text:
+                `IMPORTANT — OpenAI free token allowance ${d.remaining <= 0 ? "used up" : "almost used up"} ` +
+                `(${fmt(d.used)} of ${fmt(d.limit)} tokens today, ${fmt(Math.max(0, d.remaining))} left; ` +
+                `tokens past the limit are billed, and a request that crosses it is billed in full). ` +
+                `Stop your current work now. ` + stopNote,
+            })
+          else if (d.stopUncovered)
+            ev.system.push({
+              type: "text",
+              text:
+                `IMPORTANT — the model "${s.model}" is not covered by OpenAI's free daily tokens, so every token of ` +
+                `this session is billed. Stop your current work now. ` + stopNote,
+            })
         }
-        if (opt.capOutput && ev.options && typeof ev.options === "object") {
+        if (!s.pool) return
+        if (opt.onExhausted === "block" && opt.capOutput && ev.options && typeof ev.options === "object") {
           const room = d.remaining - promptEst
           if (room < opt.outputReserve * 2) ev.options.maxTokens = Math.max(1024, Math.floor(room))
         }
@@ -573,13 +606,22 @@ export default {
           }
           return
         }
-        if (d.uncovered && alertOnce(`uncovered-warn:${s.model}`)) {
-          desktopNotify("opencode: model not free", `${s.model} is billed from the first token.`, false)
+        if (d.uncovered && !side && alertOnce(`uncovered-warn:${s.model}`)) {
+          desktopNotify(
+            "opencode: model not free",
+            `${s.model} is billed from the first token.${d.stopUncovered ? ` Asked the agent to write ${opt.handoffFile} and stop.` : ""}`,
+            false,
+          )
           note(id, `[openai-free-tokens] Warning: ${s.model} is not covered by OpenAI's free daily tokens; this session is using paid tokens.`)
+        }
+        // sent, not yet metered: usage events can arrive after the next request is already decided
+        if (!side && s.pool) {
+          s.inflight = [...(s.inflight || []).slice(-2), { chars: s.ctxChars || 0, promptEst: s.promptEst || 0 }]
         }
         if (d.wrapUp && s.wrapped !== utcDay()) {
           s.wrapped = utcDay()
-          desktopNotify("OpenAI free tokens nearly used up", `Asked the agent to write ${opt.handoffFile} and stop. ${status()}`, true)
+          const why = d.used >= d.limit * opt.wrapUpAt ? `${Math.round(opt.wrapUpAt * 100)}% reached` : `next request (~${fmt(d.est)}) would cross the limit`
+          desktopNotify("OpenAI free tokens nearly used up", `${why}: asked the agent to write ${opt.handoffFile} and stop. ${status()}`, true)
         }
       } catch (e) {
         debug({ ev: "model.request.error", err: String(e) })
@@ -649,10 +691,15 @@ export default {
             counted.add(key)
             const tokens = stepTokens(p.tokens)
             if (!tokens) continue
+            const sent = (s.inflight || []).shift() // the request this usage belongs to (FIFO)
             const tk = p.tokens || {}
             s.lastPrompt = (tk.input || 0) + ((tk.cache && tk.cache.read) || 0) + ((tk.cache && tk.cache.write) || 0)
             s.lastOutput = (tk.output || 0) + (tk.reasoning || 0)
             const wasCompaction = s.kind === "compaction"
+            // calibrate this session's chars-per-token from the request just measured
+            // (not from a compaction: its hook payload is the compaction prompt, a different shape)
+            if (!wasCompaction && sent && sent.chars && s.lastPrompt > 1000)
+              s.ratio = Math.min(8, Math.max(2.5, sent.chars / s.lastPrompt))
             ledger.add({
               sessionID: id,
               model: s.model,

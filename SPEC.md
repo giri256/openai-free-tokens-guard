@@ -55,32 +55,35 @@ tokens = prompt_tokens + completion_tokens     (Chat Completions)
 
 ```
 pool      = pool_of(model)                      # null = not covered
-if pool is null:            block("model not covered")       # or warn, configurable
-used      = sum(today, pool)
+if pool is null:            stop("model not covered")        # stop (default) | block | warn | allow
+used      = sum(today, pool) + previous request of this conversation if its usage hasn't arrived yet
 estimate  = prompt_tokens_estimate + output_reserve
-if used + estimate > limit[pool]:  block("would cross free limit")
+if used >= 0.95 * limit[pool] or used + estimate > limit[pool]:
+    stop("free limit nearly used")              # default: soft stop (section 5); opt-in: block
 ```
 
-- `prompt_tokens_estimate`: prefer the real prompt size of the previous request in the same conversation (`input_tokens` of the last response) plus the new text. For a first request, count characters of the text actually sent ÷ 3 (conservative). Do not count opaque fields (encrypted reasoning, signatures, ids): their length says nothing about tokens.
+- `prompt_tokens_estimate`: characters of the text actually sent ÷ a chars-per-token ratio **calibrated per conversation** (characters sent for the last request ÷ its real `input_tokens`; start at 4). Never below the last request's real prompt + reply (history only grows). A fixed ÷ 3 overestimates about 2× on agent traffic (measured 4.8 chars/token incl. tool schemas) and stops work at the wrong time. Do not count opaque fields (encrypted reasoning, signatures, ids): their length says nothing about tokens.
 - `output_reserve`: room for the reply, e.g. 16,000 for reasoning models, less for small replies.
-- Near the limit, also **cap the reply**: `max_output_tokens = limit − used − prompt_estimate`, so the request cannot cross the limit even if the model writes a long answer.
-- **Blocking means not sending the request.** Return a clear error to the user: what was blocked, used/limit, and that the allowance resets at 00:00 UTC (show the time left).
+- Block mode only: near the limit, also **cap the reply**: `max_output_tokens = limit − used − prompt_estimate`, so the request cannot cross the limit even if the model writes a long answer.
+- **Soft stop is the default**: the request still goes out, with an instruction to the agent to stop (section 5). The user stays in charge and can tell it to continue.
+- **Block (opt-in) means not sending the request.** Return a clear error to the user: what was blocked, used/limit, and that the allowance resets at 00:00 UTC (show the time left).
 
 ## 5. Alerts and wrap-up
 
 - Alert the user once per day per pool at **85 %** and **95 %** (notification, banner, push message: whatever the app has).
-- **Wrap-up** (for agents or long multi-step jobs): when `used ≥ 95 %` or when fewer than ~2 more requests of the current size fit, tell the running job to stop and save its state (for a coding agent: write a handoff file in the project directory with the task, what is done, what is in progress, exact next steps). Do it while there is still room for that last step.
+- **Wrap-up / soft stop** (for agents or long multi-step jobs): when `used ≥ 95 %` or when the next request would cross the limit, tell the running job to stop and save its state, unless the user explicitly said to continue (for a coding agent: write a handoff file in the project directory with the task, what is done, what is in progress, exact next steps). Do it while there is still room for that last step.
 - If the gate blocks anyway, save what you can without the model (the app's own state, the conversation id, usage numbers) so work can resume after the reset.
 
 ## 6. Settings to expose
 
-`tier` (build | launch | grow, as shown on the Limits page), optional custom `limits`, model lists, `alert_at` (0.85, 0.95), `wrap_up_at` (0.95), `on_exhausted` (block | warn), `on_uncovered_model` (block | warn | allow), `output_reserve`.
+`tier` (build | launch | grow, as shown on the Limits page), optional custom `limits`, model lists, `alert_at` (0.85, 0.95), `wrap_up_at` (0.95), `on_exhausted` (stop | block | warn; default stop), `on_uncovered_model` (stop | block | warn | allow), `output_reserve`.
 
 ## 7. Checks a port should pass
 
 1. A request with usage `input 30,000 (cached 10,000) + output 2,000 (reasoning 500)` adds 32,000.
-2. With limit 99,000 and 64,000 used, a request estimated at 36,000 is **not sent**.
-3. A model not on either list is not sent (default setting).
-4. The counter starts from zero after 00:00 UTC.
-5. Alerts fire once at 85 % and once at 95 %, not on every request.
-6. Two processes writing at the same time do not lose a record.
+2. With limit 99,000 and 64,000 used, a request estimated at 36,000 carries the stop instruction but is still sent (default); with `on_exhausted = block` it is **not sent**.
+3. With limit 250,000 and 107,956 used, a ~54,000 request gets **no** stop instruction (no stop below 95 % unless the request would cross).
+4. A model not on either list gets the stop instruction (default) or is not sent (`block`).
+5. The counter starts from zero after 00:00 UTC.
+6. Alerts fire once at 85 % and once at 95 %, not on every request.
+7. Two processes writing at the same time do not lose a record.
